@@ -1,0 +1,352 @@
+import "Accessibility"
+
+@NSNotificationCenter
+{
+    - observe: name with: lambda `self addObserverForName: name object: nil queue: nil usingBlock:lambda`
+}
+
+@WindowManager
+{
+    accessor: #applications       initialValue: []
+    accessor: #activeWindows      initialValue: []
+    accessor: #inactiveWindows    initialValue: []
+    accessor: #windowsInMaster    initialValue: 1
+    accessor: #defaultRatio       initialValue: 0.7
+    accessor: #defaultMaxMasters  initialValue: 1
+    accessor: #layouts            initialValue: []
+    accessor: #windowChecker
+
+    - init
+    {
+        @currLayouts = {}
+        @maxMasters  = {}
+        @ratios      = {}
+        @screensThatNeedReflowing = []
+        @spacesThatNeedReflowing  = []
+
+        workspace = NSWorkspace sharedWorkspace
+        workspace runningApplications each: { app |
+             self addApplicationWithPID: app processIdentifier unless app bundleIdentifier hasPrefix: "com.apple.dashboard"
+        }
+
+        workspace notificationCenter
+                observe: NSWorkspaceDidLaunchApplicationNotification with: { n |
+                    ^nil if (n userInfo at:#NSApplicationBundleIdentifier) == nil
+                    ~self addApplicationWithPID: (n userInfo at:#NSWorkspaceApplicationKey) processIdentifier;
+                                         reflow
+                };
+                observe: NSWorkspaceDidTerminateApplicationNotification with: { n |
+                    ~self removeApplicationWithPID: (n userInfo at:#NSWorkspaceApplicationKey) processIdentifier;
+                                            reflow
+                };
+                observe: NSWorkspaceDidUnhideApplicationNotification with: { n |
+                    ~self activateApplicationWithPID: (n userInfo at:#NSWorkspaceApplicationKey) processIdentifier;
+                                              reflow
+                };
+                observe: NSWorkspaceDidHideApplicationNotification with: { n |
+                    ~self deactivateApplicationWithPID: (n userInfo at:#NSWorkspaceApplicationKey) processIdentifier;
+                                                reflow
+                };
+                observe: NSWorkspaceActiveSpaceDidChangeNotification with: { n |
+                    ~self markAllScreensForReflowing;
+                               markSpaceForReflowing: self currentSpaceId;
+                                              reflow
+                }
+        ^self
+    }
+
+    - currentSpaceId `CGSCopySpaces(_CGSDefaultConnection(), KCGSSpaceCurrent) at: 0`
+    - currentSpace
+    {
+        spaces = CGSCopySpaces(_CGSDefaultConnection(), KCGSSpaceAll)
+        idx    = spaces indexOfObject: self currentSpaceId
+        ^spaces count - idx
+    }
+    - switchToSpace: idx
+    {
+        spaces = CGSCopySpaces(_CGSDefaultConnection(), KCGSSpaceAll)
+        ^nil if spaces count <= idx
+        currentSpace = CGSCopySpaces(_CGSDefaultConnection(), KCGSSpaceCurrent)[0]
+        destSpace    = spaces[spaces count - idx - 1]
+        if currentSpace ~= destSpace {
+            CGSHideSpaces(_CGSDefaultConnection(), [currentSpace])
+            CGSShowSpaces(_CGSDefaultConnection(), [destSpace])
+            CGSManagedDisplaySetCurrentSpace(_CGSDefaultConnection(), KCGSPackagesMainDisplayIdentifier, destSpace)
+            self markSpaceForReflowing: destSpace
+            self markAllScreensForReflowing
+            (self managedWindowsForScreen: NSScreen mainScreen spaces: destSpace) first raise
+        }
+    }
+
+\ This doesn't work yet, not sure if my function prototype is wrong, or if you need elevated permissions to move windows around
+\    - moveWindow: window toSpace: destSpaceIdx
+\    {
+\        ^nil if window spaceIds count > 1
+\
+\        conn   = _CGSDefaultConnection()
+\        spaces = CGSCopySpaces(conn, KCGSSpaceAll)
+\        srcSpace  = window spaceIds at: 0
+\        destSpace = spaces[destSpaceIdx]
+\
+\        ^nil if srcSpace == destSpace
+\        destSpace print
+\        CGSMoveWorkspaceWindowList(conn,
+\                                   TQPointer to: window _cgWindow withType: #i,
+\                                    1, destSpace) print
+\        CGSRemoveWindowsFromSpaces(conn, [window _cgWindow], [srcSpace]) print
+\        CGSAddWindowsToSpaces(conn, [window _cgWindow], [destSpace]) print
+\    }
+
+    - applicationWithPID: pid
+    {
+        ^@applications find: `app| (app pid) == pid`
+    }
+    - addApplicationWithPID: pid
+    {
+        ^nil if self applicationWithPID: pid
+        app = AccessibilityElement withPID: pid
+        ^nil unless app isKindOfClass: AccessibilityApplication
+        @applications push: app
+
+        app[#AXWindows] each: { window |
+            self addWindow: window active: (0 == app[#AXHidden])
+        }
+
+        \ Watch for new window notifications
+        app observe: #AXWindowCreated on: app with: { newWindow |
+            ~self addWindow: newWindow; reflow
+        }
+    }
+
+    - addWindow: window `self addWindow: window active: yes`
+    - addWindow: window active: isActive
+    {
+        ^nil unless window isKindOfClass: AccessibilityWindow
+        ^nil unless window isResizable
+        ^nil unless @windowChecker == nil or @windowChecker(window)
+
+        self markScreenForReflowing: window screen
+        self markSpacesForReflowing: window spaceIds
+
+        if isActive && window[#AXMinimized] boolValue ~= 1 then
+            @activeWindows insert: window at: 0
+        else
+            @inactiveWindows push: window
+
+        app = self applicationWithPID: window pid
+        app observe: #AXUIElementDestroyed on: window with: { w |
+            ~self removeWindow: window; reflow
+        }
+        app observe: #AXWindowMiniaturized on: window with: { w |
+            ~self deactivateWindow: window; reflow
+        }
+        app observe: #AXWindowDeminiaturized on: window with: { w |
+            ~self activateWindow: window; reflow
+        }
+        ^valid
+    }
+
+    - managedWindowsForScreen: screen space: spaceId
+    {
+        ^@activeWindows select: { window |
+            ^no  unless (window level == 0) && (window screen == screen)
+            ^yes if window spaceIds containsObject: spaceId
+            ^no
+        }
+    }
+
+    - activateWindow: window
+    {
+        self markScreenForReflowing: window screen
+        self markSpacesForReflowing: window spaceIds
+        @activeWindows push: window
+        @inactiveWindows remove: window
+    }
+    - deactivateWindow: window
+    {
+        self markScreenForReflowing: window screen
+        self markSpacesForReflowing: window spaceIds
+        @activeWindows remove: window
+        @inactiveWindows push: window
+    }
+    - removeWindow: window
+    {
+        \ We need to get the original reference in order to access the cached screen
+        window = @activeWindows find: `w| w == window`
+        self markScreenForReflowing: window screen
+        self markSpacesForReflowing: window spaceIds
+        @activeWindows   remove: window
+        @inactiveWindows remove: window
+    }
+
+    - activateApplicationWithPID: pid
+    {
+        activated = @inactiveWindows select: `win| (win pid) == pid`
+        activated each: { window |
+            self markScreenForReflowing: window screen
+            self markSpacesForReflowing: window spaceIds
+            @inactiveWindows remove: window
+            @activeWindows push: window
+        }
+    }
+    - deactivateApplicationWithPID: pid
+    {
+        deactivated = @activeWindows select: `win| (win pid) == pid`
+        deactivated each: { window |
+            self markScreenForReflowing: window screen
+            self markSpacesForReflowing: window spaceIds
+            @activeWindows remove: window
+            @inactiveWindows push: window
+        }
+    }
+    - removeApplicationWithPID: pid
+    {
+        windowsToRemove = @activeWindows select: `win| (win pid) == pid`
+        windowsToRemove each: { window |
+            self markScreenForReflowing: window screen
+            self markSpacesForReflowing: window spaceIds
+        }
+        @activeWindows -= windowsToRemove
+        @applications = @applications select: `app| (app pid) ~= pid`
+    }
+
+    - markAllScreensForReflowing `NSScreen screens each: { s | self markScreenForReflowing: s }`
+    - markScreenForReflowing: screen
+    {
+        @screensThatNeedReflowing push: screen unless @screensThatNeedReflowing contains: screen
+    }
+    - markSpaceForReflowing: spaceId
+    {
+        @spacesThatNeedReflowing push: spaceId unless @spacesThatNeedReflowing contains: spaceId
+    }
+    - markSpacesForReflowing: spaceIds
+    {
+        spaceIds each: `spaceId| self markSpaceForReflowing: spaceId `
+    }
+    - reflow
+    {
+        currSpace = self currentSpaceId
+        ^nil unless @spacesThatNeedReflowing containsObject: currSpace
+        @screensThatNeedReflowing each: { screen |
+            (self currentLayoutForScreen:screen space:currSpace) reflow: self screen: screen space: currSpace
+        }
+        @screensThatNeedReflowing = []
+        @spacesThatNeedReflowing remove: currSpace
+        ^nil
+    }
+
+    - cycleLayouts `self cycleLayoutsForScreen: AccessibilityWindow frontMostWindow screen space: self currentSpaceId`
+    - cycleLayoutsForScreen: screen space: spaceId
+    {
+        @currLayouts[screen] ||= {}
+        layoutsForScreen = @currLayouts[screen]
+        layoutsForScreen[spaceId] ||= 0
+        layoutsForScreen[spaceId] = 0 if ++layoutsForScreen[spaceId] >= @layouts count
+        (self currentLayoutForScreen:screen space:spaceId) prepare:self
+        self markScreenForReflowing:screen
+        self markSpaceForReflowing:spaceId
+    }
+    - currentLayoutForScreen: screen space: spaceId
+    {
+        layoutsForScreen = @currLayouts[screen]
+        layoutsForScreen[spaceId] ||= 0
+        ^@layouts[layoutsForScreen[spaceId]]
+    }
+
+    - windowBefore:   win `(self currentLayoutForScreen: win screen space:self currentSpaceId)  windowBefore: win inWm: self`
+    - windowAfter:    win `(self currentLayoutForScreen: win screen space:self currentSpaceId)   windowAfter: win inWm: self`
+    - focusOnWindow:  win `(self currentLayoutForScreen: win screen space:self currentSpaceId) focusOnWindow: win inWm: self`
+
+    - selectPreviousWindow: window `self focusOnWindow: (self windowBefore: window)`
+    - selectNextWindow: window     `self focusOnWindow: (self windowAfter: window)`
+
+    - swapWindow: a with: b
+    {
+        if a ~= b {
+            idxA = @activeWindows indexOf: a
+            idxB = @activeWindows indexOf: b
+            @activeWindows[idxA], @activeWindows[idxB] = @activeWindows[idxB], @activeWindows[idxA]
+            self markScreenForReflowing: a screen
+            self markSpacesForReflowing: a spaceIds
+            self markScreenForReflowing: b screen
+            self markSpacesForReflowing: b spaceIds
+            ^b
+        }
+    }
+    - swapWithPreviousWindow: window
+    {
+        self swapWindow: window with: (self windowBefore: window)
+    }
+    - swapWithNextWindow: window
+    {
+        self swapWindow: window with: (self windowAfter: window)
+    }
+    \ Swaps the window with it's closest counterpart on the other side
+    - swapWithCounterpart: window
+    {
+        \ Get the existing reference managing the same physical window
+        screen  = window screen
+        space   = self currentSpaceId
+        windows = self managedWindowsForScreen: screen space: space
+        idx     = windows indexOf: window
+        masterCount = self maxMastersOnScreen: screen space: space
+        isOnLeft    = idx < masterCount
+
+        winCount = windows count
+        if isOnLeft {
+            otherIdx = masterCount + (winCount - masterCount) * (idx / masterCount)
+            otherIdx = otherIdx ceil if (idx / masterCount) >= 0.5
+        } else
+            otherIdx = masterCount * ((idx - masterCount) / (winCount - masterCount))
+
+        self swapWindow: window with: windows[otherIdx] if otherIdx < windows count
+    }
+
+    - focusOnScreen: screen
+    {
+        (self managedWindowsForScreen: screen space: self currentSpaceId) first raise
+    }
+    - moveWindow: window toScreen: destScreen
+    {
+        srcScreen = window screen
+        ^nil if srcScreen == destScreen
+
+        currSpace = self currentSpaceId
+        self markScreenForReflowing: srcScreen
+        self markScreenForReflowing: destScreen
+        self  markSpaceForReflowing: currSpace
+
+        @activeWindows remove: window
+        @activeWindows insert: window at: 0
+
+        screenFrame = destScreen flippedFrame
+        windowsOnDestScreen = self managedWindowsForScreen: destScreen space: currSpace
+        if windowsOnDestScreen count > 0 {
+            currentlyFocused = windowsOnDestScreen[0]
+            window setFrame: currentlyFocused frame
+        } else
+            window setFrame: screenFrame
+    }
+
+    - ratioForScreen: screen space: spaceId `@ratios[screen][spaceId] || @defaultRatio`
+    - setRatio: ratio forScreen: screen space: spaceId
+    {
+        if (ratio > 0) && (ratio < 1) {
+            @ratios[screen] ||= {}
+            @ratios[screen][spaceId] = ratio
+            self markScreenForReflowing: screen
+            self markSpaceForReflowing: self currentSpaceId
+        }
+    }
+
+    - maxMastersOnScreen: screen space: spaceId `@maxMasters[screen][spaceId] || @defaultMaxMasters`
+    - setMaxMasters: max onScreen: screen space: spaceId
+    {
+        if max > 0 {
+            @maxMasters[screen] ||= {}
+            @maxMasters[screen][spaceId] = max
+            self markScreenForReflowing: screen
+            self markSpaceForReflowing: self currentSpaceId
+        }
+    }
+}
